@@ -12,15 +12,10 @@ const API_BASE_URL = process.env.API_BASE_URL || 'http://166.1.144.111:5001';
 
 const bot = new TelegramBot(token, { polling: true });
 
-bot.on('polling_error', (error) => {
-  console.error('Polling error:', error.message);
-});
+bot.on('polling_error', (error) => console.error('Polling error:', error.message));
+bot.on('error', (error) => console.error('Bot error:', error.message));
 
-bot.on('error', (error) => {
-  console.error('Bot error:', error.message);
-});
-
-// Обработка /start с параметром (логин или ID)
+// Обработка /start
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const param = match[1];
@@ -35,7 +30,7 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
         return bot.sendMessage(chatId, '❌ Аккаунт не найден. Зайди на сайт и нажми «Подключить» еще раз.');
       }
 
-      // Привязываем chatId к пользователю через отдельный эндпоинт
+      // Привязываем chatId
       await axios.post(`${API_BASE_URL}/api/user/link-telegram`, {
         login: user.login,
         telegramChatId: chatId.toString()
@@ -43,7 +38,10 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
 
       const keyboard = {
         reply_markup: {
-          keyboard: [[{ text: '🆘 Помощь' }, { text: '👥 Мои аккаунты' }]],
+          keyboard: [
+            [{ text: '🆘 Помощь' }, { text: '👥 Мои аккаунты' }],
+            [{ text: '🔗 Отвязать аккаунт' }]
+          ],
           resize_keyboard: true
         }
       };
@@ -72,7 +70,7 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   }
 });
 
-// Обработка кнопок
+// Обработка обычных сообщений (кнопки)
 bot.on('message', async (msg) => {
   const text = msg.text;
   const chatId = msg.chat.id;
@@ -80,17 +78,15 @@ bot.on('message', async (msg) => {
   if (!text || text.startsWith('/')) return;
 
   try {
+    const users = await axios.get(`${API_BASE_URL}/api/user/by-telegram/${chatId}`).then(res => res.data);
+
     if (text === '🆘 Помощь') {
       await bot.sendMessage(
         chatId,
-        '🤖 **Как это работает?**\nЯ слежу за твоими аккаунтами и напоминаю, если огненная серия 🔥 может сгореть.\n\nКнопки в меню:\n👥 **Мои аккаунты** — покажет список всех привязанных аккаунтов и их статистику.\n🆘 **Помощь** — это сообщение.',
+        '🤖 **Как это работает?**\nЯ слежу за твоими аккаунтами и напоминаю, если огненная серия 🔥 может сгореть.\n\nКнопки в меню:\n👥 **Мои аккаунты** — покажет список всех привязанных аккаунтов и их статистику.\n🔗 **Отвязать аккаунт** — отвяжет выбранный аккаунт от Telegram.\n🆘 **Помощь** — это сообщение.',
         { parse_mode: 'Markdown' }
       );
     } else if (text === '👥 Мои аккаунты') {
-      // Запрашиваем список аккаунтов, привязанных к этому chatId
-      const response = await axios.get(`${API_BASE_URL}/api/user/by-telegram/${chatId}`);
-      const users = response.data;
-
       if (users.length === 0) {
         await bot.sendMessage(chatId, 'У тебя пока нет привязанных аккаунтов. Подключи их через сайт.');
       } else {
@@ -100,10 +96,45 @@ bot.on('message', async (msg) => {
         }
         await bot.sendMessage(chatId, accountsText, { parse_mode: 'Markdown' });
       }
+    } else if (text === '🔗 Отвязать аккаунт') {
+      if (users.length === 0) {
+        return bot.sendMessage(chatId, 'У вас нет привязанных аккаунтов.');
+      }
+      // Предлагаем выбрать аккаунт через инлайн-кнопки
+      const inlineKeyboard = {
+        reply_markup: {
+          inline_keyboard: users.map(u => [{
+            text: `${u.login} (${u.xp} XP)`,
+            callback_data: `unbind_${u.login}`
+          }])
+        }
+      };
+      await bot.sendMessage(chatId, 'Выберите аккаунт для отвязки:', inlineKeyboard);
     }
   } catch (error) {
     console.error('Error in message handler:', error.message);
     bot.sendMessage(chatId, '⚠️ Ошибка при обработке сообщения.');
+  }
+});
+
+// Обработка нажатий на инлайн-кнопки
+bot.on('callback_query', async (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
+  const data = callbackQuery.data;
+
+  if (data.startsWith('unbind_')) {
+    const login = data.replace('unbind_', '');
+    try {
+      await axios.post(`${API_BASE_URL}/api/user/unlink-telegram`, { login });
+      await bot.sendMessage(chatId, `✅ Аккаунт **${login}** успешно отвязан.`, { parse_mode: 'Markdown' });
+      // Обновляем клавиатуру, если нужно (можно просто удалить сообщение)
+      await bot.deleteMessage(chatId, callbackQuery.message.message_id);
+      await bot.answerCallbackQuery(callbackQuery.id);
+    } catch (err) {
+      console.error('Unbind error:', err);
+      await bot.sendMessage(chatId, `❌ Не удалось отвязать аккаунт ${login}. Попробуйте позже.`);
+      await bot.answerCallbackQuery(callbackQuery.id);
+    }
   }
 });
 
