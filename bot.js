@@ -1,6 +1,7 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const express = require('express'); // Добавляем express для health check
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -8,12 +9,44 @@ if (!token) {
   process.exit(1);
 }
 
-const API_BASE_URL = process.env.API_BASE_URL || 'http://166.1.144.111:5001';
+const API_BASE_URL = process.env.API_BASE_URL || 'https://b.zeroyt.ru'; // Меняем на ваш домен с HTTPS
 
-const bot = new TelegramBot(token, { polling: true });
+// Создаем HTTP сервер для health check
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-bot.on('polling_error', (error) => console.error('Polling error:', error.message));
-bot.on('error', (error) => console.error('Bot error:', error.message));
+// Health check endpoint для Render
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// Запускаем HTTP сервер
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Health check server listening on port ${PORT}`);
+});
+
+// Создаем бота с polling
+const bot = new TelegramBot(token, { 
+  polling: true,
+  // Добавляем таймауты для избежания ошибок
+  request: {
+    timeout: 30000
+  }
+});
+
+// Обработка ошибок polling
+bot.on('polling_error', (error) => {
+  // Игнорируем ошибки связанные с таймаутом, они не критичны
+  if (error.code === 'ETIMEDOUT' || error.code === 'EFATAL') {
+    console.log('Polling timeout (normal)');
+    return;
+  }
+  console.error('Polling error:', error.message);
+});
+
+bot.on('error', (error) => {
+  console.error('Bot error:', error.message);
+});
 
 // Обработка /start
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
@@ -66,6 +99,10 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
     }
   } catch (error) {
     console.error('Error in /start handler:', error.message);
+    if (error.response) {
+      console.error('Response data:', error.response.data);
+      console.error('Response status:', error.response.status);
+    }
     bot.sendMessage(chatId, '⚠️ Произошла ошибка. Попробуй позже.');
   }
 });
@@ -127,7 +164,7 @@ bot.on('callback_query', async (callbackQuery) => {
     try {
       await axios.post(`${API_BASE_URL}/api/user/unlink-telegram`, { login });
       await bot.sendMessage(chatId, `✅ Аккаунт **${login}** успешно отвязан.`, { parse_mode: 'Markdown' });
-      // Обновляем клавиатуру, если нужно (можно просто удалить сообщение)
+      // Обновляем клавиатуру (удаляем сообщение с кнопками)
       await bot.deleteMessage(chatId, callbackQuery.message.message_id);
       await bot.answerCallbackQuery(callbackQuery.id);
     } catch (err) {
@@ -138,4 +175,4 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-console.log('Telegram bot started');
+console.log('Telegram bot started with health check');
