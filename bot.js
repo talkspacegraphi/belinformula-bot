@@ -4,8 +4,6 @@ const axios = require('axios');
 const express = require('express');
 const https = require('https');
 
-// Создаем HTTPS агент с отключенной проверкой сертификатов
-// ВНИМАНИЕ: это временное решение, пока не настроите HTTPS правильно
 const httpsAgent = new https.Agent({
   rejectUnauthorized: false
 });
@@ -16,7 +14,6 @@ if (!token) {
   process.exit(1);
 }
 
-// Используем HTTPS с отключенной проверкой сертификатов
 const API_BASE_URL = process.env.API_BASE_URL || 'https://b.zeroyt.ru';
 
 const app = express();
@@ -24,17 +21,14 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
-// Запускаем HTTP сервер
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Health check server listening on port ${PORT}`);
 });
 
-// Создаем бота с polling
 const bot = new TelegramBot(token, {
   polling: true,
   polling_options: {
@@ -43,18 +37,16 @@ const bot = new TelegramBot(token, {
   },
   request: {
     timeout: 30000,
-    agent: httpsAgent // Используем наш агент с отключенной проверкой
+    agent: httpsAgent
   }
 });
 
-// Создаем axios instance с отключенной проверкой SSL
 const api = axios.create({
   baseURL: API_BASE_URL,
   httpsAgent: httpsAgent,
   timeout: 30000
 });
 
-// Обработка ошибок polling
 bot.on('polling_error', (error) => {
   if (error.code === 'ETIMEDOUT' || error.code === 'EFATAL') {
     console.log('Polling timeout (normal)');
@@ -75,69 +67,98 @@ bot.on('error', (error) => {
   console.error('Bot error:', error.message);
 });
 
+// Полная клавиатура со всеми кнопками
+const fullKeyboard = {
+  reply_markup: {
+    keyboard: [
+      [{ text: '🆘 Помощь' }, { text: '👥 Мои аккаунты' }],
+      [{ text: '🔗 Отвязать аккаунт' }]
+    ],
+    resize_keyboard: true
+  }
+};
+
+// Минимальная клавиатура (только помощь)
+const minimalKeyboard = {
+  reply_markup: {
+    keyboard: [[{ text: '🆘 Помощь' }]],
+    resize_keyboard: true
+  }
+};
+
 // Обработка /start
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const param = match[1];
 
   try {
-    console.log(`/start called with param: ${param}`);
-    
     if (param) {
-      // Запрашиваем пользователя через API
-      const response = await api.get(`/api/user/${param}`);
-      const user = response.data;
-
-      if (!user) {
-        return bot.sendMessage(chatId, '❌ Аккаунт не найден. Зайди на сайт и нажми «Подключить» еще раз.');
+      console.log(`🔗 Привязка с параметром: ${param}`);
+      
+      if (param.startsWith('user_')) {
+        // Безопасная привязка по ID
+        const userId = param.replace('user_', '');
+        
+        const response = await api.post('/api/user/secure-link-telegram', {
+          userId: userId,
+          telegramChatId: chatId.toString()
+        });
+        
+        const user = response.data;
+        
+        // Отправляем сообщение с ПОЛНОЙ клавиатурой
+        await bot.sendMessage(
+          chatId,
+          `✅ Аккаунт **${user.login}** успешно привязан! 👋\n\nТеперь я буду оповещать тебя, когда тебе нужно зайти на сайт, выполнить задания и не потерять серию 🔥.`,
+          { parse_mode: 'Markdown', ...fullKeyboard }
+        );
+        
+        console.log(`✅ Пользователь ${user.login} привязал Telegram`);
+      } else {
+        // Старый небезопасный метод - показываем сообщение об ошибке
+        await bot.sendMessage(
+          chatId,
+          '❌ Устаревший метод привязки. Пожалуйста, используйте кнопку на сайте для подключения.'
+        );
       }
-
-      // Привязываем chatId
-      await api.post('/api/user/link-telegram', {
-        login: user.login,
-        telegramChatId: chatId.toString()
-      });
-
-      const keyboard = {
-        reply_markup: {
-          keyboard: [
-            [{ text: '🆘 Помощь' }, { text: '👥 Мои аккаунты' }],
-            [{ text: '🔗 Отвязать аккаунт' }]
-          ],
-          resize_keyboard: true
-        }
-      };
-
-      await bot.sendMessage(
-        chatId,
-        `Привет, ${user.login}! 👋\n\nЯ успешно подключен! Буду оповещать тебя, когда тебе нужно зайти на сайт, выполнить задания и не потерять серию 🔥.`,
-        keyboard
-      );
     } else {
-      const keyboard = {
-        reply_markup: {
-          keyboard: [[{ text: '🆘 Помощь' }]],
-          resize_keyboard: true
+      // Обычный /start без параметра
+      console.log(`📱 Новый пользователь: ${chatId}`);
+      
+      // Проверяем, есть ли уже привязанные аккаунты у этого chatId
+      try {
+        const users = await api.get(`/api/user/by-telegram/${chatId}`).then(res => res.data);
+        
+        if (users && users.length > 0) {
+          // У пользователя уже есть привязанные аккаунты - показываем полную клавиатуру
+          await bot.sendMessage(
+            chatId,
+            `👋 С возвращением! У вас привязано ${users.length} аккаунт(ов).`,
+            fullKeyboard
+          );
+        } else {
+          // Новый пользователь - показываем минимальную клавиатуру
+          await bot.sendMessage(
+            chatId,
+            'Добро пожаловать в бота BELIMFORMULA! 🎓\n\nЧтобы привязать аккаунт, зайди в **настройки** на сайте и нажми кнопку «Подключить Telegram».',
+            { parse_mode: 'Markdown', ...minimalKeyboard }
+          );
         }
-      };
-      await bot.sendMessage(
-        chatId,
-        'Добро пожаловать в бота BELIMFORMULA! 🎓\n\nЧтобы привязать аккаунт, зайди в **настройки** на сайте и нажми кнопку «Подключить Telegram».',
-        { parse_mode: 'Markdown', ...keyboard }
-      );
+      } catch (error) {
+        // Если ошибка при проверке, показываем минимальную клавиатуру
+        console.error('Ошибка при проверке пользователей:', error.message);
+        await bot.sendMessage(
+          chatId,
+          'Добро пожаловать в бота BELIMFORMULA! 🎓\n\nЧтобы привязать аккаунт, зайди в **настройки** на сайте и нажми кнопку «Подключить Telegram».',
+          { parse_mode: 'Markdown', ...minimalKeyboard }
+        );
+      }
     }
   } catch (error) {
-    console.error('Error in /start handler:', error.message);
+    console.error('❌ Error in /start handler:', error.message);
     if (error.response) {
-      console.error('Response status:', error.response.status);
       console.error('Response data:', error.response.data);
-    }
-    if (error.code === 'ECONNREFUSED') {
-      return bot.sendMessage(chatId, '❌ Сервер временно недоступен. Попробуй позже.');
-    }
-    if (error.message.includes('EPROTO') || error.message.includes('SSL')) {
-      console.log('SSL Error in /start (ignored):', error.message);
-      return bot.sendMessage(chatId, '⚠️ Проблема с подключением. Пробуем снова...');
+      console.error('Response status:', error.response.status);
     }
     bot.sendMessage(chatId, '⚠️ Произошла ошибка. Попробуй позже.');
   }
@@ -151,30 +172,46 @@ bot.on('message', async (msg) => {
   if (!text || text.startsWith('/')) return;
 
   try {
-    console.log(`Message from ${chatId}: ${text}`);
+    console.log(`📨 Сообщение от ${chatId}: ${text}`);
     
     const users = await api.get(`/api/user/by-telegram/${chatId}`).then(res => res.data);
+    const hasAccounts = users && users.length > 0;
 
     if (text === '🆘 Помощь') {
-      await bot.sendMessage(
-        chatId,
-        '🤖 **Как это работает?**\nЯ слежу за твоими аккаунтами и напоминаю, если огненная серия 🔥 может сгореть.\n\nКнопки в меню:\n👥 **Мои аккаунты** — покажет список всех привязанных аккаунтов и их статистику.\n🔗 **Отвязать аккаунт** — отвяжет выбранный аккаунт от Telegram.\n🆘 **Помощь** — это сообщение.',
-        { parse_mode: 'Markdown' }
-      );
+      let helpText = '🤖 **Как это работает?**\n\n';
+      helpText += 'Я слежу за твоими аккаунтами и напоминаю, если огненная серия 🔥 может сгореть.\n\n';
+      helpText += '**Кнопки в меню:**\n';
+      helpText += '• 👥 **Мои аккаунты** — покажет список всех привязанных аккаунтов и их статистику.\n';
+      helpText += '• 🔗 **Отвязать аккаунт** — отвяжет выбранный аккаунт от Telegram.\n';
+      helpText += '• 🆘 **Помощь** — это сообщение.\n\n';
+      
+      if (!hasAccounts) {
+        helpText += '💡 **У вас пока нет привязанных аккаунтов.**\n';
+        helpText += 'Зайдите в настройки на сайте и нажмите кнопку «Подключить Telegram».';
+      }
+      
+      await bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
+      
     } else if (text === '👥 Мои аккаунты') {
-      if (users.length === 0) {
+      if (!hasAccounts) {
         await bot.sendMessage(chatId, 'У тебя пока нет привязанных аккаунтов. Подключи их через сайт.');
       } else {
-        let accountsText = '👥 *Твои привязанные аккаунты:*\n\n';
+        let accountsText = '👥 **Твои привязанные аккаунты:**\n\n';
         for (const u of users) {
-          accountsText += `👤 **${u.login}**\n🏆 Опыт: ${u.xp} XP\n🏅 Лига: ${u.league}\n🔥 Серия: ${u.streak} дн.\n❤️ Жизни: ${u.lives}/5\n\n`;
+          accountsText += `👤 **${u.login}**\n`;
+          accountsText += `🏆 Опыт: ${u.xp} XP\n`;
+          accountsText += `🏅 Лига: ${u.league || 'Бронза'}\n`;
+          accountsText += `🔥 Серия: ${u.streak || 0} дн.\n`;
+          accountsText += `❤️ Жизни: ${u.lives}/5\n\n`;
         }
         await bot.sendMessage(chatId, accountsText, { parse_mode: 'Markdown' });
       }
+      
     } else if (text === '🔗 Отвязать аккаунт') {
-      if (users.length === 0) {
+      if (!hasAccounts) {
         return bot.sendMessage(chatId, 'У вас нет привязанных аккаунтов.');
       }
+      
       // Предлагаем выбрать аккаунт через инлайн-кнопки
       const inlineKeyboard = {
         reply_markup: {
@@ -188,10 +225,6 @@ bot.on('message', async (msg) => {
     }
   } catch (error) {
     console.error('Error in message handler:', error.message);
-    if (error.message.includes('EPROTO') || error.message.includes('SSL')) {
-      console.log('SSL Error in message handler (ignored):', error.message);
-      return;
-    }
     bot.sendMessage(chatId, '⚠️ Ошибка при обработке сообщения.');
   }
 });
@@ -205,21 +238,39 @@ bot.on('callback_query', async (callbackQuery) => {
     const login = data.replace('unbind_', '');
     try {
       await api.post('/api/user/unlink-telegram', { login });
+      
+      // После успешной отвязки отправляем подтверждение
       await bot.sendMessage(chatId, `✅ Аккаунт **${login}** успешно отвязан.`, { parse_mode: 'Markdown' });
+      
       // Удаляем сообщение с кнопками
       await bot.deleteMessage(chatId, callbackQuery.message.message_id);
+      
+      // Проверяем, остались ли у пользователя привязанные аккаунты
+      const users = await api.get(`/api/user/by-telegram/${chatId}`).then(res => res.data);
+      
+      if (users.length === 0) {
+        // Если аккаунтов не осталось, предлагаем обновить клавиатуру
+        await bot.sendMessage(
+          chatId,
+          'У вас больше нет привязанных аккаунтов. Чтобы привязать новый, зайдите в настройки на сайте.',
+          minimalKeyboard
+        );
+      } else {
+        // Если остались, показываем актуальную клавиатуру
+        await bot.sendMessage(
+          chatId,
+          `У вас осталось ${users.length} привязанных аккаунтов.`,
+          fullKeyboard
+        );
+      }
+      
       await bot.answerCallbackQuery(callbackQuery.id);
     } catch (err) {
-      console.error('Unbind error:', err.message);
-      if (err.message.includes('EPROTO') || err.message.includes('SSL')) {
-        console.log('SSL Error in unbind (ignored):', err.message);
-        await bot.answerCallbackQuery(callbackQuery.id);
-        return;
-      }
+      console.error('Unbind error:', err);
       await bot.sendMessage(chatId, `❌ Не удалось отвязать аккаунт ${login}. Попробуйте позже.`);
       await bot.answerCallbackQuery(callbackQuery.id);
     }
   }
 });
 
-console.log('🤖 Telegram bot started with SSL bypass');
+console.log('🤖 Telegram bot started with full keyboard support');
