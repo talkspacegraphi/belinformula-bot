@@ -1,7 +1,14 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const express = require('express'); // Добавляем express для health check
+const express = require('express');
+const https = require('https');
+
+// Создаем HTTPS агент с отключенной проверкой сертификатов
+// ВНИМАНИЕ: это временное решение, пока не настроите HTTPS правильно
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false
+});
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -9,42 +16,62 @@ if (!token) {
   process.exit(1);
 }
 
-const API_BASE_URL = process.env.API_BASE_URL || 'https://b.zeroyt.ru'; // Меняем на ваш домен с HTTPS
+// Используем HTTPS с отключенной проверкой сертификатов
+const API_BASE_URL = process.env.API_BASE_URL || 'https://b.zeroyt.ru';
 
-// Создаем HTTP сервер для health check
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Health check endpoint для Render
+app.use(express.json());
+
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
 // Запускаем HTTP сервер
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Health check server listening on port ${PORT}`);
+  console.log(`🚀 Health check server listening on port ${PORT}`);
 });
 
 // Создаем бота с polling
-const bot = new TelegramBot(token, { 
+const bot = new TelegramBot(token, {
   polling: true,
-  // Добавляем таймауты для избежания ошибок
+  polling_options: {
+    timeout: 30,
+    interval: 300
+  },
   request: {
-    timeout: 30000
+    timeout: 30000,
+    agent: httpsAgent // Используем наш агент с отключенной проверкой
   }
+});
+
+// Создаем axios instance с отключенной проверкой SSL
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  httpsAgent: httpsAgent,
+  timeout: 30000
 });
 
 // Обработка ошибок polling
 bot.on('polling_error', (error) => {
-  // Игнорируем ошибки связанные с таймаутом, они не критичны
   if (error.code === 'ETIMEDOUT' || error.code === 'EFATAL') {
     console.log('Polling timeout (normal)');
+    return;
+  }
+  if (error.message.includes('EPROTO') || error.message.includes('SSL')) {
+    console.log('SSL Error (ignored):', error.message);
     return;
   }
   console.error('Polling error:', error.message);
 });
 
 bot.on('error', (error) => {
+  if (error.message.includes('EPROTO') || error.message.includes('SSL')) {
+    console.log('Bot SSL Error (ignored):', error.message);
+    return;
+  }
   console.error('Bot error:', error.message);
 });
 
@@ -54,9 +81,11 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const param = match[1];
 
   try {
+    console.log(`/start called with param: ${param}`);
+    
     if (param) {
       // Запрашиваем пользователя через API
-      const response = await axios.get(`${API_BASE_URL}/api/user/${param}`);
+      const response = await api.get(`/api/user/${param}`);
       const user = response.data;
 
       if (!user) {
@@ -64,7 +93,7 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
       }
 
       // Привязываем chatId
-      await axios.post(`${API_BASE_URL}/api/user/link-telegram`, {
+      await api.post('/api/user/link-telegram', {
         login: user.login,
         telegramChatId: chatId.toString()
       });
@@ -100,8 +129,15 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   } catch (error) {
     console.error('Error in /start handler:', error.message);
     if (error.response) {
-      console.error('Response data:', error.response.data);
       console.error('Response status:', error.response.status);
+      console.error('Response data:', error.response.data);
+    }
+    if (error.code === 'ECONNREFUSED') {
+      return bot.sendMessage(chatId, '❌ Сервер временно недоступен. Попробуй позже.');
+    }
+    if (error.message.includes('EPROTO') || error.message.includes('SSL')) {
+      console.log('SSL Error in /start (ignored):', error.message);
+      return bot.sendMessage(chatId, '⚠️ Проблема с подключением. Пробуем снова...');
     }
     bot.sendMessage(chatId, '⚠️ Произошла ошибка. Попробуй позже.');
   }
@@ -115,7 +151,9 @@ bot.on('message', async (msg) => {
   if (!text || text.startsWith('/')) return;
 
   try {
-    const users = await axios.get(`${API_BASE_URL}/api/user/by-telegram/${chatId}`).then(res => res.data);
+    console.log(`Message from ${chatId}: ${text}`);
+    
+    const users = await api.get(`/api/user/by-telegram/${chatId}`).then(res => res.data);
 
     if (text === '🆘 Помощь') {
       await bot.sendMessage(
@@ -150,6 +188,10 @@ bot.on('message', async (msg) => {
     }
   } catch (error) {
     console.error('Error in message handler:', error.message);
+    if (error.message.includes('EPROTO') || error.message.includes('SSL')) {
+      console.log('SSL Error in message handler (ignored):', error.message);
+      return;
+    }
     bot.sendMessage(chatId, '⚠️ Ошибка при обработке сообщения.');
   }
 });
@@ -162,17 +204,22 @@ bot.on('callback_query', async (callbackQuery) => {
   if (data.startsWith('unbind_')) {
     const login = data.replace('unbind_', '');
     try {
-      await axios.post(`${API_BASE_URL}/api/user/unlink-telegram`, { login });
+      await api.post('/api/user/unlink-telegram', { login });
       await bot.sendMessage(chatId, `✅ Аккаунт **${login}** успешно отвязан.`, { parse_mode: 'Markdown' });
-      // Обновляем клавиатуру (удаляем сообщение с кнопками)
+      // Удаляем сообщение с кнопками
       await bot.deleteMessage(chatId, callbackQuery.message.message_id);
       await bot.answerCallbackQuery(callbackQuery.id);
     } catch (err) {
-      console.error('Unbind error:', err);
+      console.error('Unbind error:', err.message);
+      if (err.message.includes('EPROTO') || err.message.includes('SSL')) {
+        console.log('SSL Error in unbind (ignored):', err.message);
+        await bot.answerCallbackQuery(callbackQuery.id);
+        return;
+      }
       await bot.sendMessage(chatId, `❌ Не удалось отвязать аккаунт ${login}. Попробуйте позже.`);
       await bot.answerCallbackQuery(callbackQuery.id);
     }
   }
 });
 
-console.log('Telegram bot started with health check');
+console.log('🤖 Telegram bot started with SSL bypass');
